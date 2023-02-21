@@ -10,7 +10,7 @@ import pprint
 import shutil
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import piexif
@@ -29,7 +29,7 @@ except ImportError:
 
 BLOCKSIZE = 65536
 # In order from most preferred to least:
-TIME_KEYS = ("DateTime", "DateTimeOriginal", "DateTimeDigitized")
+TIME_KEYS = ("DateTime", "DateTimeOriginal", "DateTimeDigitized", "PreviewDateTime")
 BUFFER = 0.05
 EXIFTOOL2PIL = {
     # 'Acceleration Vector': ('Acceleration', 37892),
@@ -38,6 +38,8 @@ EXIFTOOL2PIL = {
     'Camera Model Name': ('Model', 272),
     'Color Space': ('ColorSpace', 40961),
     'Create Date': ('DateTime', 306),
+    'Date Created': ('DateTime', 306),
+    'Date/Time Created': ('DateTime', 36868),
     'Date/Time Original': ('DateTimeOriginal', 36867),
     'Exif Image Height': ('ExifImageHeight', 40963),
     'Exif Image Width': ('ExifImageWidth', 40962),
@@ -66,6 +68,7 @@ EXIFTOOL2PIL = {
     'GPS Speed Ref': ('GPSSpeedRef', 12),
     'Host Computer': ('HostComputer', 316),
     'ISO': ('ISOSpeed', 34867),
+    'Image Description': ('ImageDescription', 270),
     'Image Height': ('ImageLength', 257),
     'Image Width': ('ImageWidth', 256),
     'Lens ID': ('LensSpecification', 42034),
@@ -73,6 +76,7 @@ EXIFTOOL2PIL = {
     'Lens Make': ('LensMake', 42035),
     'Lens Model': ('LensModel', 42036),
     'Make': ('Make', 271),
+    'Modify Date': ('PreviewDateTime', 50971),
     'Offset Time': ('OffsetTime', 36880),
     'Offset Time Digitized': ('OffsetTimeDigitized', 36882),
     'Offset Time Original': ('OffsetTimeOriginal', 36881),
@@ -116,9 +120,17 @@ def convert_to_decimal(data) -> float:
     parts = data.split(" ")
     try:
         pm = 1.0 if parts[-1] in ("N", "E") else -1.0
+        lat_lon = 'lat' if parts[-1] in ("N", "S") else 'lon'
+        degrees = float(parts[0])
+        if lat_lon == 'lat' and degrees * pm > 90.0:
+            logger.warning("bad latitude %d", degrees)
+            raise ValueError
+        if lat_lon == 'lon' and degrees * pm > 180.0:
+            logger.warning("bad longitude %d", degrees)
+            raise ValueError
         minutes = float(parts[2][0:-1])
         seconds = float(parts[3][0:-1]) / 60.0
-        return pm * (float(parts[0]) + (minutes + seconds) / 60)
+        return pm * (degrees + (minutes + seconds) / 60)
     except (IndexError, ValueError):
         raise ValueError(f"Cannot parse {data}")  # pylint: disable=raise-missing-from
 
@@ -132,6 +144,7 @@ class PhotoFileMan:
         self.args = args
         logger.debug(pprint.pformat(self.args))
         self.since = self._parse_date(self.args['since'])
+        logger.debug(self.since)
         self.metadata = {}
         self.exiftool = {}
         self.geodata = {}
@@ -275,31 +288,34 @@ class PhotoFileMan:
             capture_output=True,
             check=False,
         )
-        lines = output.stdout.decode()
-        # logger.debug(lines)
         if self.exiftool is None:
             self.exiftool = {}
-        rval = {}
-        for line in lines.split("\n"):
+        for part in output.stdout.split(b"\n"):
+            logger.debug(part)
+            try:
+                line = part.decode()
+            except UnicodeDecodeError as ude:
+                logger.error("%s in %s: %r", ude, filepath.as_posix(), part)
+                continue
             label = line.split(':')[0].strip()
             if label not in EXIFTOOL2PIL:
                 continue
             if EXIFTOOL2PIL[label] in self.exiftool:
                 # Override Create Date, as this seems to have time zone always (Z).
                 if label != 'GPS Date/Time':
-                    logger.warning("duplicate label: %r", EXIFTOOL2PIL[label])
+                    if label not in ('Focal Length', 'Date/Time Original', 'Create Date'):
+                        # These seem to be duplicated a lot, so don't complain.
+                        logger.warning("duplicate label: %r in %s", EXIFTOOL2PIL[label], filepath.as_posix())
                     continue
             if EXIFTOOL2PIL[label] in EXIF_INTS:
                 val = (int(line[34:].strip()), 1)
             else:
                 val = line[34:].strip()
-            rval[EXIFTOOL2PIL[label][0]] = val
-            self.exiftool[EXIFTOOL2PIL[label]] = val
+            self.exiftool[EXIFTOOL2PIL[label][0]] = val
         # logger.debug(pprint.pformat(self.exiftool))
-        logger.debug(rval)
-        return rval
+        logger.debug(self.exiftool)
 
-    def _get_exif(self, filepath: Path) -> dict:
+    def _get_exif(self, filepath: Path):
         """
         Get exif data via the first successful tool for the file.
 
@@ -316,7 +332,8 @@ class PhotoFileMan:
             #     return cyheif.get_exif_data(filepath.as_posix().encode())
             # except:  # noqa pylint: disable=bare-except
             #     logger.debug("cyheif failed on %s", filepath)
-            return self._exiftool(filepath)
+            self._exiftool(filepath)
+            return
         logger.debug("opening image file %r", filepath)
         try:
             im = Image.open(filepath)
@@ -325,16 +342,19 @@ class PhotoFileMan:
         except:  # noqa pylint: disable=bare-except
             logger.debug("PIL failed on %s", filepath)
         try:
-            return self._exiftool(filepath)
+            self._exiftool(filepath)
+            return
         except:  # noqa pylint: disable=bare-except
             logger.debug("exiftool failed on %s", filepath)
         try:
             # Hachoir has minimal metadata extraction, so try it last.
             parser = createParser(filepath.as_posix())
             metadata = extractMetadata(parser)
-            return {"DateTime": metadata.get("creation_date")}
+            self.exiftool = {"DateTime": metadata.get("creation_date")}
+            return
         except:  # noqa pylint: disable=bare-except
-            raise ValueError("no metadata found")  # pylint: disable=W0707
+            pass
+        raise ValueError("no metadata found")  # pylint: disable=W0707
 
     def _parse_timestamp(self, date_string: str) -> datetime:  # pylint: disable=R0201
         """
@@ -363,7 +383,13 @@ class PhotoFileMan:
                     pass
         logger.debug("trying fromisoformat")
         try:
-            return datetime.fromisoformat(date_string)
+            rval = datetime.fromisoformat(date_string)
+            logger.debug(rval)
+            tz = time.strftime("%Z", time.localtime())
+            logger.debug(tz)
+            rval = pytz.timezone(tz).localize(rval)
+            logger.debug(rval)
+            return rval
         except ValueError:
             pass
         jj = "%Y:%m:%d %H:%M:%S%Z"
@@ -393,31 +419,36 @@ class PhotoFileMan:
             return rval
         except ValueError:
             pass
+        try: # 2018:07:28+0000
+            rval = datetime.strptime(date_string, "%Y:%m:%d%z")
+            logger.debug(rval)
+            return rval
+        except ValueError:
+            pass
         logger.warning("failed to parse %s", date_string)
         return None
 
-    def _save_metadata(self, ex: dict):
+    def _save_metadata(self, filepath: Path):
         """
         Get all needed metadata from the exif dictionary.
         """
-        if ex is None:
-            logger.warning("got an unexpected None in _save_metadata")
+        if self.exiftool is None:
+            logger.debug("got an unexpected None in _save_metadata for %s", filepath.as_posix())
             return
-        logger.debug(len(ex))
-        for kk, vv in ex.items():
+        logger.debug(len(self.exiftool))
+        for kk, vv in self.exiftool.items():
+            logger.debug("%r: %r", kk, vv)
             if kk in ('GPSLatitude', 'GPSLongitude'):
                 self.metadata[kk[3:]] = convert_to_decimal(vv)
                 continue
             if kk not in EXIF_TAGS:
-                logger.debug("%r not found in ExifTags.TAGS", kk)
+                logger.debug("%r (%r) not found in ExifTags.TAGS", kk, vv)
                 continue
-            logger.debug("%r: %r", kk, vv)
             if kk in TIME_KEYS:
+                logger.debug("%s -> %s", kk, vv)
                 if '-' not in vv and '+' not in vv:
-                    if 'OffsetTime' in ex:
-                        self.metadata[kk] = self._parse_timestamp(vv + ex['OffsetTime'])
-                    else:
-                        self.metadata[kk] = self._parse_timestamp(vv + '+0000')
+                    off = self.exiftool.get('OffsetTime', '+0000')
+                    self.metadata[kk] = self._parse_timestamp(vv + off)
                 else:
                     self.metadata[kk] = self._parse_timestamp(vv)
             if kk in ("ImageDescription", "XPTitle", "Latitude", "Longitude"):
@@ -442,24 +473,22 @@ class PhotoFileMan:
         :raise: KeyError when no timestamp key is found
         """
         if not self.metadata:
-            self._save_metadata(self._get_exif(filepath))
+            self._get_exif(filepath)
+            self._save_metadata(filepath)
         logger.debug(pprint.pformat(self.metadata))
         rval = self._get_first_date()
         if not rval and self.exiftool is None:
-            self._save_metadata(self._exiftool(filepath))
+            logger.debug("failed getting metadata, so trying again")
+            self._exiftool(filepath)
+            self._save_metadata(filepath)
             rval = self._get_first_date()
         if not rval:
-            logger.warning("none of %s found, so using file creation time", TIME_KEYS)
+            logger.warning("none of %s found for %s, so using file creation time", TIME_KEYS, filepath.as_posix())
             rval.append(datetime.fromtimestamp(filepath.stat().st_mtime))
         # Add additional dates, if available.
-        if "DateTimeOriginal" in self.metadata:
-            rval.append(self.metadata["DateTimeOriginal"])
-        else:
-            rval.append(rval[0])
-        if "DateTimeDigitized" in self.metadata:
-            rval.append(self.metadata["DateTimeDigitized"])
-        else:
-            rval.append(rval[0])
+        rval.append(self.metadata.get("DateTimeOriginal", rval[0]))
+        rval.append(self.metadata.get("DateTimeDigitized", rval[0]))
+        rval.append(self.metadata.get("PreviewDateTime", rval[0]))
         return rval
 
     def get_date(self, filepath: Path) -> datetime:  # pylint: disable=R0201
@@ -476,32 +505,35 @@ class PhotoFileMan:
             raise ValueError(f"No date found for {filepath.as_posix()}")
         d1 = dates[1] if len(dates) > 1 and dates[1] is not None else d0
         d2 = dates[2] if len(dates) > 2 and dates[2] is not None else d0
+        d3 = dates[3] if len(dates) > 3 and dates[3] is not None else d0
         rval = d0 if d0 < d1 else d1
         rval = d2 if d2 < rval else rval
+        rval = d3 if d3 < rval else rval
         self.metadata['first_date'] = rval
         logger.debug(rval)
         return rval
 
-    def make_path(self, base: Path, date: datetime) -> Path:
+    def make_path(self, base: Path) -> Path:
         """
         Make the output path, if necessary.
 
         @param base: base destination directory
         @param date: output of early_date(), datetime instance
         """
-        dpath = base.joinpath(date.strftime("%Y"), date.strftime("%m"))
-        logger.debug(dpath)
+        fd = self.metadata['first_date']
+        if 'night' in self.args and int(fd.strfime("%H")) < self.args['night']:
+            day = fd - timedelta(day=1)
+        else:
+            day = fd
+        dpath = base.joinpath(day.strftime("%Y"), day.strftime("%m"))
         if not self.args["month"]:
-            dpath = dpath.joinpath(date.strftime("%d"))
-            logger.debug(dpath)
+            dpath = dpath.joinpath(day.strftime("%d"))
+        logger.debug(dpath)
         logger.debug(self.metadata)
         if self.args["geo_group"] and "Latitude" in self.metadata:
             self.get_geoname()
             if 'place' in self.metadata:
-                if self.args["month"]:
-                    dpath = dpath.joinpath(f"{date.strftime('%d')}-{self.metadata['place']}")
-                else:
-                    dpath = dpath.joinpath(self.metadata['place'])
+                dpath = dpath.joinpath(self.metadata['place'])
         if not dpath.exists():
             logger.info("creating %s", dpath)
             dpath.mkdir(parents=True)
@@ -518,17 +550,19 @@ class PhotoFileMan:
         @return: full Path to the metadata and options determined destination
         """
         logger.debug("%r, %r", src, dst)
-        date = self.get_date(src)
         # don't make a path, if we're just renaming a file
-        tdir = self.make_path(dst, date) if src.parent != dst else dst
+        tdir = self.make_path(dst) if src.parent != dst else dst
         fn = src.name
         if self.args["image_description"]:
             if "ImageDescription" in self.metadata:
-                fn = self.metadata["ImageDescription"].replace(" ", "") + src.suffix
+                fn = self.metadata["ImageDescription"].replace(" ", "_") + src.suffix
             elif "XPTitle" in self.metadata:
-                fn = self.metadata["XPTitle"].replace(" ", "") + src.suffix
+                fn = self.metadata["XPTitle"].replace(" ", "_") + src.suffix
         if self.args["command"][0] == "rename" or self.args["rename"]:
-            fn = f"{date.strftime('%Y-%m-%dT%H:%M')}-{fn}"
+            sep = '-' if self.args['phone'] else ':'
+            head = self.metadata['first_date'].strftime(f'%Y-%m-%dT%H{sep}%M')
+            if not fn.startswith(head):
+                fn = f"{head}-{fn}"
         rval = tdir.joinpath(fn)
         logger.debug(rval)
         if (
@@ -551,7 +585,21 @@ class PhotoFileMan:
                 buf = afile.read(BLOCKSIZE)
         return hasher.hexdigest()
 
-    def check_source(self) -> bool:
+    def check_file_date(self, ff: Path, label: str) -> bool:
+        """
+        If the since option is used, check the file timestamp to see if it's old.
+
+        :return: True if the file should be skipped
+        """
+        if not self.since:
+            return False
+        stat_date = datetime.fromtimestamp(ff.stat().st_mtime).date()
+        if stat_date <= self.since:
+            logger.info("skipping %s for old file %s with stat date %s", label, ff.as_posix(), stat_date)
+            return True
+        return False
+
+    def check_source(self, ff: Path, label: str) -> bool:
         """
         If the since option is used, make sure the source is newer.
 
@@ -562,6 +610,7 @@ class PhotoFileMan:
         meta_date = self.metadata['first_date'].date()
         logger.debug("%r <= %r?", meta_date, self.since)
         if meta_date <= self.since:
+            logger.info("skipping %s for old file %s with exif date %s", label, ff.as_posix(), meta_date)
             return True
         return False
 
@@ -598,7 +647,6 @@ class PhotoFileMan:
         """
         if src.suffix.lower() not in (".heic", ".heif"):
             return False
-        logger.debug("converting %r to %r", src, jpeg)
         try:
             # pylint: disable=c-extension-no-member
             pil_img = cyheif.get_pil_image(src.as_posix().encode())
@@ -622,6 +670,7 @@ class PhotoFileMan:
         logger.debug(pprint.pformat({kk: vv for kk, vv in pil_exif.items()}))
         if self.args["dry_run"]:
             return False
+        logger.info("converting %r to %r", src, jpeg)
         try:
             exif_bytes = piexif.dump(pil_exif)
             logger.debug("saving %s with %d bytes of exif", jpeg.as_posix(), len(exif_bytes))
@@ -636,12 +685,17 @@ class PhotoFileMan:
         """
         Copy or move the given file.
         """
+        if self.check_file_date(ff, cmd):
+            return False
+        self.get_date(ff)
+        if self.check_source(ff, cmd):
+            return False
         trgt = self.get_target(ff, Path(self.args["destination"]))
         if ff == trgt:
             logger.error("calculated target, %s, is the same as the source", trgt)
             return False
-        if self.check_source() or self.check_target(ff, trgt):
-            logger.debug("skipping %s for %s", cmd, trgt)
+        if self.check_target(ff, trgt):
+            logger.debug("skipping %s for target %s", cmd, trgt)
             return False
         if self.args['convert']:
             if self.convert_file(ff, trgt):
@@ -676,8 +730,13 @@ class PhotoFileMan:
 
         :param args: dictionary of command line options
         """
+        if self.check_file_date(ff, 'convert'):
+            return False
+        self.get_date(ff)
+        if self.check_source(ff, 'convert'):
+            return False
         ntrgt = self.get_target(ff, ff.parent)
-        if self.check_source() or self.check_target(ff, ntrgt):
+        if self.check_target(ff, ntrgt):
             logger.debug("not converting")
             return None
         if not self.args["dry_run"]:
@@ -690,11 +749,16 @@ class PhotoFileMan:
 
         :param args: dictionary of command line options
         """
+        if self.check_file_date(ff, 'rename'):
+            return False
+        self.get_date(ff)
+        if self.check_source(ff, 'rename'):
+            return False
         ntrgt = self.get_target(ff, ff.parent)
-        if self.check_source() or self.check_target(ff, ntrgt):
+        if self.check_target(ff, ntrgt):
             logger.debug("not renaming")
             return None
-        logger.debug("%r to %r", ff, ntrgt)
+        logger.info("%r to %r", ff, ntrgt)
         if not self.args["dry_run"]:
             ff.rename(ntrgt)
         return ntrgt
@@ -704,10 +768,12 @@ class PhotoFileMan:
         Touch files with earliest metadata date.
         """
         if 'first_date' not in self.metadata:
+            if self.check_file_date(ff, 'touch'):
+                return False
             self.get_date(ff)
-        if self.check_source():
+        if self.check_source(ff, 'touch'):
             return False
-        logger.debug("%r to %s", ff, self.metadata['first_date'])
+        logger.info("%r to %s", ff, self.metadata['first_date'])
         if not self.args["dry_run"]:
             os.utime(ff, times=(self.metadata['first_date'].timestamp(),
                                 self.metadata['first_date'].timestamp()))
@@ -763,6 +829,7 @@ if __name__ == "__main__":
     m_output = os.path.join(os.environ["HOME"], "Pictures")
     m_parser = argparse.ArgumentParser(description="Manage photo and video files")
     m_parser.add_argument("-D", "--debug", action="store_true")
+    m_parser.add_argument("-V", "--verbose", action="store_true")
     m_parser.add_argument(
         "-d", "--dry-run", action="store_true", help="do not actually modify files"
     )
@@ -783,6 +850,12 @@ if __name__ == "__main__":
         "--rename",
         action="store_true",
         help="rename files to YYYY-MM-DD_existing_file_name, in addition to copy or move",
+    )
+    m_parser.add_argument(
+        "-p",
+        "--phone",
+        action="store_true",
+        help="with rename, don't use : in file names since that character doesn't sync to some cell phones",
     )
     m_parser.add_argument(
         "-i",
@@ -810,6 +883,14 @@ if __name__ == "__main__":
         help="copy or move to town name based subdirectories (YYYY/MM/DD-[Town]",
     )
     m_parser.add_argument(
+        "-n",
+        "--night",
+        action="store",
+        default=4,
+        type=int,
+        help="Use this hour as the cut-off AM hour for pictures to be the previous day in copy or move directories",
+    )
+    m_parser.add_argument(
         "-s",
         "--since",
         help="YYYY-MM-DD format date that all pictures must come after",
@@ -835,6 +916,8 @@ if __name__ == "__main__":
     m_args = m_parser.parse_args()
     if m_args.debug:
         logger.setLevel(logging.DEBUG)
-    else:
+    elif m_args.verbose:
         logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
     PhotoFileMan(vars(m_args)).main()
