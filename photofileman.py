@@ -134,7 +134,6 @@ def convert_to_decimal(data) -> float:
     except (IndexError, ValueError):
         raise ValueError(f"Cannot parse {data}")  # pylint: disable=raise-missing-from
 
-
 class PhotoFileMan:
     """
     Manipulate images, particularly as available from an iOS device.
@@ -146,11 +145,11 @@ class PhotoFileMan:
         self.since = self._parse_date(self.args['since'])
         logger.debug(self.since)
         self.metadata = {}
-        self.exiftool = {}
+        self.exiftool = False
         self.geodata = {}
         self.nominatim = None
         if Nominatim is not None and self.args["geo_group"]:
-            self.nominatim = Nominatim(user_agent="photofileman")
+            self.nominatim = Nominatim(user_agent="PhotoFileManager")
             self.cache_geodata()
 
     def _parse_date(self, date_input):
@@ -288,8 +287,6 @@ class PhotoFileMan:
             capture_output=True,
             check=False,
         )
-        if self.exiftool is None:
-            self.exiftool = {}
         for part in output.stdout.split(b"\n"):
             logger.debug(part)
             try:
@@ -300,20 +297,21 @@ class PhotoFileMan:
             label = line.split(':')[0].strip()
             if label not in EXIFTOOL2PIL:
                 continue
-            if EXIFTOOL2PIL[label] in self.exiftool:
+            if EXIFTOOL2PIL[label] in self.metadata:
                 # Override Create Date, as this seems to have time zone always (Z).
                 if label != 'GPS Date/Time':
                     if label not in ('Focal Length', 'Date/Time Original', 'Create Date'):
-                        # These seem to be duplicated a lot, so don't complain.
+                        # These ^ seem to be duplicated a lot, so don't complain.
                         logger.warning("duplicate label: %r in %s", EXIFTOOL2PIL[label], filepath.as_posix())
                     continue
             if EXIFTOOL2PIL[label] in EXIF_INTS:
                 val = (int(line[34:].strip()), 1)
             else:
                 val = line[34:].strip()
-            self.exiftool[EXIFTOOL2PIL[label][0]] = val
-        # logger.debug(pprint.pformat(self.exiftool))
-        logger.debug(self.exiftool)
+            self.metadata[EXIFTOOL2PIL[label][0]] = val
+        # logger.debug(pprint.pformat(self.metadata))
+        logger.debug(self.metadata)
+        self.exiftool = True
 
     def _get_exif(self, filepath: Path):
         """
@@ -337,8 +335,14 @@ class PhotoFileMan:
         logger.debug("opening image file %r", filepath)
         try:
             im = Image.open(filepath)
-            self.exiftool = None
-            return im._getexif()  # pylint: disable=protected-access
+            exif = im.getexif()
+            logger.debug(dir(exif))
+            for kk, vv in exif.items():
+                key = ExifTags.TAGS.get(kk, '')
+                logger.debug("%r (%r) -> %r", key, kk, vv)
+                if key:
+                    self.metadata[key] = vv
+            return
         except:  # noqa pylint: disable=bare-except
             logger.debug("PIL failed on %s", filepath)
         try:
@@ -350,7 +354,7 @@ class PhotoFileMan:
             # Hachoir has minimal metadata extraction, so try it last.
             parser = createParser(filepath.as_posix())
             metadata = extractMetadata(parser)
-            self.exiftool = {"DateTime": metadata.get("creation_date")}
+            self.metadata = {"DateTime": metadata.get("creation_date")}
             return
         except:  # noqa pylint: disable=bare-except
             pass
@@ -428,31 +432,31 @@ class PhotoFileMan:
         logger.warning("failed to parse %s", date_string)
         return None
 
-    def _save_metadata(self, filepath: Path):
+    def _update_metadata(self):
         """
         Get all needed metadata from the exif dictionary.
         """
-        if self.exiftool is None:
-            logger.debug("got an unexpected None in _save_metadata for %s", filepath.as_posix())
-            return
-        logger.debug(len(self.exiftool))
-        for kk, vv in self.exiftool.items():
-            logger.debug("%r: %r", kk, vv)
-            if kk in ('GPSLatitude', 'GPSLongitude'):
-                self.metadata[kk[3:]] = convert_to_decimal(vv)
+        logger.debug(len(self.metadata))
+        keys = list(self.metadata.keys())
+        for key in keys:
+            val = self.metadata[key]
+            logger.debug("%r: %r", key, val)
+            if key in ('GPSLatitude', 'GPSLongitude'):
+                self.metadata[key[3:]] = convert_to_decimal(val)
                 continue
-            if kk not in EXIF_TAGS:
-                logger.debug("%r (%r) not found in ExifTags.TAGS", kk, vv)
+            if key not in EXIF_TAGS:
+                logger.debug("%r not found in ExifTags.TAGS", key)
+                del self.metadata[key]
                 continue
-            if kk in TIME_KEYS:
-                logger.debug("%s -> %s", kk, vv)
-                if '-' not in vv and '+' not in vv:
-                    off = self.exiftool.get('OffsetTime', '+0000')
-                    self.metadata[kk] = self._parse_timestamp(vv + off)
+            if key in TIME_KEYS:
+                if '-' not in val and '+' not in val:
+                    off = self.metadata.get('OffsetTime', '+0000')
+                    logger.debug("setting timestamp offset to %s", off)
+                    self.metadata[key] = self._parse_timestamp(val + off)
                 else:
-                    self.metadata[kk] = self._parse_timestamp(vv)
-            if kk in ("ImageDescription", "XPTitle", "Latitude", "Longitude"):
-                self.metadata[kk] = vv
+                    self.metadata[key] = self._parse_timestamp(val)
+            # if kk in ("ImageDescription", "XPTitle", "Latitude", "Longitude"):
+            #     self.metadata[kk] = vv
         logger.debug(self.metadata)
 
     def _get_first_date(self):
@@ -472,15 +476,14 @@ class PhotoFileMan:
         :return: three timestamps or raise
         :raise: KeyError when no timestamp key is found
         """
-        if not self.metadata:
-            self._get_exif(filepath)
-            self._save_metadata(filepath)
-        logger.debug(pprint.pformat(self.metadata))
+        self._get_exif(filepath)
+        if self.metadata:
+            self._update_metadata()
         rval = self._get_first_date()
-        if not rval and self.exiftool is None:
-            logger.debug("failed getting metadata, so trying again")
+        if not rval and not self.exiftool:
+            logger.debug("failed getting metadata dates, so trying again")
             self._exiftool(filepath)
-            self._save_metadata(filepath)
+            self._update_metadata()
             rval = self._get_first_date()
         if not rval:
             logger.warning("none of %s found for %s, so using file creation time", TIME_KEYS, filepath.as_posix())
@@ -513,33 +516,84 @@ class PhotoFileMan:
         logger.debug(rval)
         return rval
 
-    def make_path(self, base: Path) -> Path:
+    def _use_current_bottom_dir(self, indir: Path, outdir: Path) -> Path:
+        """
+        Use the directory just before the filename of the source directory at
+        the same level in the output.
+        """
+        logger.debug(indir)
+        rval = outdir.joinpath(indir.parts[-2])
+        logger.debug(rval)
+        return rval
+
+    def _make_flat_path(self, base: Path, day: datetime) -> Path:
+        """
+        Build a flat directory name.
+        """
+        logger.debug(day)
+        if self.args["month"]:
+            date_path = day.strftime("%Y-%m")
+        else:
+            date_path = day.strftime("%Y-%m-%d")
+        if self.args["geo_group"] and "Latitude" in self.metadata:
+            self.get_geoname()
+        try:
+            rval = base.joinpath(f"{date_path}-{self.metadata['place']}")
+        except KeyError:
+            rval = base.joinpath(date_path)
+        logger.debug(rval)
+        return rval
+
+    def _make_nest_path(self, base: Path, day: datetime) -> Path:
+        """
+        Build a nested directory structure.
+        """
+        logger.debug(day)
+        rval = base.joinpath(day.strftime("%Y"), day.strftime("%m"))
+        if not self.args["month"]:
+            rval = rval.joinpath(day.strftime("%d"))
+        if self.args["geo_group"] and "Latitude" in self.metadata:
+            self.get_geoname()
+            if 'place' in self.metadata:
+                rval = rval.joinpath(self.metadata['place'])
+        logger.debug(rval)
+        return rval
+
+    def make_path(self, src: Path, base: Path) -> Path:
         """
         Make the output path, if necessary.
 
         @param base: base destination directory
-        @param date: output of early_date(), datetime instance
         """
         fd = self.metadata['first_date']
-        if 'night' in self.args and int(fd.strfime("%H")) < self.args['night']:
-            day = fd - timedelta(day=1)
+        if 'night' in self.args and int(fd.strftime("%H")) < self.args['night']:
+            day = fd - timedelta(days=1)
         else:
             day = fd
-        dpath = base.joinpath(day.strftime("%Y"), day.strftime("%m"))
-        if not self.args["month"]:
-            dpath = dpath.joinpath(day.strftime("%d"))
-        logger.debug(dpath)
         logger.debug(self.metadata)
-        if self.args["geo_group"] and "Latitude" in self.metadata:
-            self.get_geoname()
-            if 'place' in self.metadata:
-                dpath = dpath.joinpath(self.metadata['place'])
-        if not dpath.exists():
+        if self.args['use_the_dir']:
+            dpath = self._use_current_bottom_dir(src, base)
+        elif self.args['flat']:
+            dpath = self._make_flat_path(base, day)
+        else:
+            dpath = self._make_nest_path(base, day)
+        if not dpath.exists() and not self.args['dry_run']:
             logger.info("creating %s", dpath)
             dpath.mkdir(parents=True)
         else:
             logger.debug("using %s", dpath)
         return dpath
+
+    def make_ok_filename(self, src: Path, text: str) -> str:
+        """
+        Handle characters coming from description text that don't make good filenames.
+        """
+        nospace = text.replace(" ", "_")
+        if self.args['phone']:
+            base = ''.join([ii if ii.isalpha() or ii.isdecimal() or ii == '_' else '-' for ii in nospace])
+        else:
+            base = nospace.replace("/", '-').replace('\\', '-').replace(':', '-')
+        return base + src.suffix
 
     def get_target(self, src: Path, dst: Path) -> Path:
         """
@@ -551,15 +605,21 @@ class PhotoFileMan:
         """
         logger.debug("%r, %r", src, dst)
         # don't make a path, if we're just renaming a file
-        tdir = self.make_path(dst) if src.parent != dst else dst
-        fn = src.name
-        if self.args["image_description"]:
-            if "ImageDescription" in self.metadata:
-                fn = self.metadata["ImageDescription"].replace(" ", "_") + src.suffix
-            elif "XPTitle" in self.metadata:
-                fn = self.metadata["XPTitle"].replace(" ", "_") + src.suffix
+        tdir = self.make_path(src, dst) if src.parent != dst else dst
+        if self.args["image_description"] and "ImageDescription" in self.metadata:
+            fn = self.make_ok_filename(src, self.metadata["ImageDescription"])
+            logger.debug("ImageDescription file name: %s", fn)
+        elif self.args["image_description"] and "XPTitle" in self.metadata:
+            fn = self.make_ok_filename(src, self.metadata["XPTitle"])
+            logger.debug("XPTitle file name: %s", fn)
+        elif self.args['phone']:
+            fn = self.make_ok_filename(src, src.name)
+            logger.debug("phone compatible file name: %s", fn)
+        else:
+            fn = src.name
+            logger.debug("base file name: %s", fn)
+        sep = '-' if self.args['phone'] else ':'
         if self.args["command"][0] == "rename" or self.args["rename"]:
-            sep = '-' if self.args['phone'] else ':'
             head = self.metadata['first_date'].strftime(f'%Y-%m-%dT%H{sep}%M')
             if not fn.startswith(head):
                 fn = f"{head}-{fn}"
@@ -625,6 +685,7 @@ class PhotoFileMan:
         """
         logger.debug("%r, %r", src, trgt)
         if not trgt.exists():
+            logger.debug("no target")
             return False
         if self.get_MD5(src) == self.get_MD5(trgt):
             logger.warning("%s already exists as the same file", trgt)
@@ -655,7 +716,7 @@ class PhotoFileMan:
             return False
         pil_exif = piexif.load(pil_img.info['exif'])
         # logger.debug(pil_exif)
-        for key, val in self.exiftool.items():
+        for key, val in EXIF_KEYS.items():
             for kk, vv in PIEXIF_MAP.items():
                 ifd = getattr(piexif, vv)
                 if getattr(ifd, key[0], False) and key[1] not in pil_exif[kk]:
@@ -697,12 +758,15 @@ class PhotoFileMan:
         if self.check_target(ff, trgt):
             logger.debug("skipping %s for target %s", cmd, trgt)
             return False
+        logger.debug(self.args)
         if self.args['convert']:
             if self.convert_file(ff, trgt):
                 if cmd == "move":
+                    logger.debug("deleting %s", ff)
                     ff.unlink()
                 return trgt
-        elif not self.args["dry_run"]:
+        # if the file type doesn't need conversion, fall through to copy or move
+        if not self.args["dry_run"]:
             if cmd == "copy":
                 logger.info("copying %s to %s", ff, trgt)
                 shutil.copy2(ff, trgt)
@@ -789,7 +853,7 @@ class PhotoFileMan:
                 logger.debug(ff.as_posix())
                 if ff.is_file():
                     self.metadata.clear()
-                    self.exiftool.clear()
+                    self.exiftool = False
                     try:
                         trgt = getattr(self, self.args['command'][0])(ff)
                         logger.debug("%r and %r and not %r", trgt, self.args['touch'], self.args["dry_run"])
@@ -837,7 +901,7 @@ if __name__ == "__main__":
         "-S", "--scan-dirs", action="store_true", help="scan output directories for location information"
     )
     m_parser.add_argument(
-        "-f", "--force", action="store_true", help="force overwriting existing output"
+        "-F", "--force", action="store_true", help="force overwriting existing output"
     )
     m_parser.add_argument(
         "-c",
@@ -849,7 +913,7 @@ if __name__ == "__main__":
         "-r",
         "--rename",
         action="store_true",
-        help="rename files to YYYY-MM-DD_existing_file_name, in addition to copy or move",
+        help="rename files to YYYY-MM-DDTHH:MM_existing_file_name, in addition to copy or move",
     )
     m_parser.add_argument(
         "-p",
@@ -877,6 +941,18 @@ if __name__ == "__main__":
         help="copy or move to month directories (YYYY/MM) rather than day (YYYY/MM/DD)",
     )
     m_parser.add_argument(
+        "-f",
+        "--flat",
+        action="store_true",
+        help="use a flat directory structure (YYYY-MM-DD) rather than nested (YYYY/MM/DD)",
+    )
+    m_parser.add_argument(
+        "-u",
+        "--use-the-dir",
+        action="store_true",
+        help="use a flat directory structure (YYYY-MM-DD) rather than nested (YYYY/MM/DD)",
+    )
+    m_parser.add_argument(
         "-g",
         "--geo-group",
         action="store_true",
@@ -888,7 +964,7 @@ if __name__ == "__main__":
         action="store",
         default=4,
         type=int,
-        help="Use this hour as the cut-off AM hour for pictures to be the previous day in copy or move directories",
+        help="Use this hour (default 4) as the cut-off AM hour for pictures to be the previous day in copy or move directories",
     )
     m_parser.add_argument(
         "-s",
